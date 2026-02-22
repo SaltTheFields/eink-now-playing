@@ -1,0 +1,312 @@
+esphome:
+  name: eink-now-playing
+  friendly_name: E-Ink Now Playing
+  on_boot:
+    priority: -100
+    then:
+      - switch.turn_on: display_power
+      - delay: 500ms
+      - component.update: epaper_display
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+  reboot_timeout: 0s
+  on_client_connected:
+    then:
+      - logger.log: "HA client connected!"
+      - delay: 2s
+      - component.update: epaper_display
+
+interval:
+  - interval: 30s
+    then:
+      - logger.log:
+          level: INFO
+          format: "Heartbeat - Title: %s | Artist: %s | State: %s"
+          args:
+            - 'id(media_title).has_state() ? id(media_title).state.c_str() : "N/A"'
+            - 'id(media_artist).has_state() ? id(media_artist).state.c_str() : "N/A"'
+            - 'id(media_player_state).has_state() ? id(media_player_state).state.c_str() : "N/A"'
+      - if:
+          condition:
+            lambda: 'return id(media_title).has_state() && id(media_title).state.length() > 0;'
+          then:
+            - component.update: epaper_display
+
+ota:
+  - platform: esphome
+
+external_components:
+  - source: github://semvis123/esphome-crowpanel-4.2-epaper
+    components: [crowpanel_epaper]
+
+http_request:
+  verify_ssl: false
+  timeout: 15s
+  watchdog_timeout: 20s
+
+# --- Display power switch (GPIO7 must be HIGH before SPI) ---
+switch:
+  - platform: gpio
+    pin: GPIO7
+    id: display_power
+    restore_mode: ALWAYS_ON
+
+# --- Fonts ---
+font:
+  - file:
+      type: gfonts
+      family: Roboto Condensed
+      weight: 700
+    id: font_title
+    size: 22
+    glyphs: '!"%()+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]abcdefghijklmnopqrstuvwxyz{|}~° àáâãäåèéêëìíîïòóôõöùúûüýÿñçß&''#$*_'
+
+  - file: "gfonts://Roboto Condensed"
+    id: font_artist
+    size: 18
+    glyphs: '!"%()+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]abcdefghijklmnopqrstuvwxyz{|}~° àáâãäåèéêëìíîïòóôõöùúûüýÿñçß&''#$*_'
+
+  - file: "gfonts://Roboto"
+    id: font_state
+    size: 14
+    glyphs: '!"%()+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]abcdefghijklmnopqrstuvwxyz{|}~° '
+
+# --- Home Assistant text sensors ---
+text_sensor:
+  - platform: homeassistant
+    name: "Media Title"
+    id: media_title
+    entity_id: media_player.home_group
+    attribute: media_title
+
+  - platform: homeassistant
+    name: "Media Artist"
+    id: media_artist
+    entity_id: media_player.home_group
+    attribute: media_artist
+
+  - platform: homeassistant
+    name: "Media Image URL"
+    id: media_image_url
+    entity_id: media_player.home_group
+    attribute: entity_picture
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x.length() > 0;'
+            then:
+              - lambda: |-
+                  std::string url = x;
+                  if (url.substr(0, 4) != "http") {
+                    url = "http://YOUR_HA_URL:8123" + url;
+                  }
+                  ESP_LOGI("album_art", "Downloading album art: %s", url.c_str());
+              - online_image.set_url:
+                  id: album_art
+                  url: !lambda |-
+                    std::string url = x;
+                    if (url.substr(0, 4) != "http") {
+                      url = "http://YOUR_HA_URL:8123" + url;
+                    }
+                    return url;
+            else:
+              - logger.log: "entity_picture is empty"
+              - component.update: epaper_display
+
+  - platform: homeassistant
+    name: "Media Player State"
+    id: media_player_state
+    entity_id: media_player.home_group
+
+# --- Online image for album art ---
+online_image:
+  - url: "https://via.placeholder.com/230"
+    id: album_art
+    format: JPEG
+    type: BINARY
+    resize: 200x200
+    on_download_finished:
+      then:
+        - component.update: epaper_display
+    on_error:
+      then:
+        - logger.log: "Album art download failed"
+        - component.update: epaper_display
+
+# --- E-ink display ---
+display:
+  - platform: crowpanel_epaper
+    id: epaper_display
+    model: 4.20in
+    cs_pin: GPIO45
+    dc_pin: GPIO46
+    reset_pin: GPIO47
+    busy_pin: GPIO48
+    clk_pin: GPIO12
+    mosi_pin: GPIO11
+    full_update_every: 1
+    update_interval: never
+    lambda: |-
+      int w = it.get_width();   // 400
+      int h = it.get_height();  // 300
+
+      // --- Skip refresh if no real data (keeps previous screen) ---
+      if (!id(media_title).has_state() || id(media_title).state.length() == 0) {
+        return;
+      }
+
+      // --- Album art with border (shifted right for labels) ---
+      int label_w = 75;
+      int content_w = w - label_w;
+      int art_size = 200;
+      int art_x = label_w + (content_w - art_size) / 2;
+      int art_y = 5;
+
+      // Draw border (2px thick)
+      it.rectangle(art_x - 2, art_y - 2, art_size + 4, art_size + 4);
+      it.rectangle(art_x - 1, art_y - 1, art_size + 2, art_size + 2);
+
+      if (id(album_art).get_width() > 0) {
+        it.image(art_x, art_y, id(album_art), COLOR_OFF, COLOR_ON);
+      } else {
+        it.rectangle(art_x, art_y, art_size, art_size);
+        it.printf(art_x + art_size / 2, art_y + art_size / 2, id(font_artist), TextAlign::CENTER, "No Art");
+      }
+
+      // --- Track title (full width, wraps to 2 lines if needed) ---
+      int text_y = art_y + art_size + 8;
+      std::string title = "Unknown Title";
+      if (id(media_title).has_state() && id(media_title).state.length() > 0) {
+        title = id(media_title).state;
+      }
+      int max_chars = 32;  // ~400px worth at 22px bold
+      int title_lines = 1;
+      if ((int)title.length() > max_chars) {
+        // Find a space near the midpoint to wrap
+        int mid = max_chars;
+        while (mid > 0 && title[mid] != ' ') mid--;
+        if (mid == 0) mid = max_chars;  // no space found, hard break
+        std::string line1 = title.substr(0, mid);
+        std::string line2 = title.substr(mid + (title[mid] == ' ' ? 1 : 0));
+        if ((int)line2.length() > max_chars) {
+          line2 = line2.substr(0, max_chars - 3) + "...";
+        }
+        it.printf(w / 2, text_y, id(font_title), TextAlign::TOP_CENTER, "%s", line1.c_str());
+        it.printf(w / 2, text_y + 24, id(font_title), TextAlign::TOP_CENTER, "%s", line2.c_str());
+        title_lines = 2;
+      } else {
+        it.printf(w / 2, text_y, id(font_title), TextAlign::TOP_CENTER, "%s", title.c_str());
+      }
+
+      // --- Artist name (full width) ---
+      int artist_y = text_y + 24 * title_lines + 4;
+      std::string artist = "Unknown Artist";
+      if (id(media_artist).has_state() && id(media_artist).state.length() > 0) {
+        artist = id(media_artist).state;
+      }
+      if ((int)artist.length() > 38) {
+        artist = artist.substr(0, 35) + "...";
+      }
+      it.printf(w / 2, artist_y, id(font_artist), TextAlign::TOP_CENTER, "%s", artist.c_str());
+
+      // --- Playback state ---
+      int state_y = artist_y + 20;
+      std::string state = "idle";
+      if (id(media_player_state).has_state() && id(media_player_state).state.length() > 0) {
+        state = id(media_player_state).state;
+        if (state.length() > 0) {
+          state[0] = toupper(state[0]);
+        }
+      }
+      it.printf(w / 2, state_y, id(font_state), TextAlign::TOP_CENTER, "%s", state.c_str());
+
+      // --- Control labels on left side next to rotary/buttons ---
+      // Rotary is on the left side of screen
+      // Top area: rotary up/down/press labels, bottom area: MENU and EXIT buttons
+      it.printf(4, 25, id(font_state), TextAlign::CENTER_LEFT, "Stop");
+      it.printf(4, 120, id(font_state), TextAlign::CENTER_LEFT, "Next");
+      it.printf(4, 150, id(font_state), TextAlign::CENTER_LEFT, "Play/Pause");
+      it.printf(4, 180, id(font_state), TextAlign::CENTER_LEFT, "Previous");
+      it.printf(4, 275, id(font_state), TextAlign::CENTER_LEFT, "Refresh");
+
+# --- Physical buttons ---
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Dial Up (Prev)"
+    on_press:
+      then:
+        - homeassistant.service:
+            service: media_player.media_previous_track
+            data:
+              entity_id: media_player.home_group
+
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Dial Down (Next)"
+    on_press:
+      then:
+        - homeassistant.service:
+            service: media_player.media_next_track
+            data:
+              entity_id: media_player.home_group
+
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Dial Press (Play/Pause)"
+    on_press:
+      then:
+        - homeassistant.service:
+            service: media_player.media_play_pause
+            data:
+              entity_id: media_player.home_group
+
+  - platform: gpio
+    pin:
+      number: GPIO2
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Menu (Refresh)"
+    on_press:
+      then:
+        - component.update: epaper_display
+
+  - platform: gpio
+    pin:
+      number: GPIO1
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Exit (Stop)"
+    on_press:
+      then:
+        - homeassistant.service:
+            service: media_player.media_stop
+            data:
+              entity_id: media_player.home_group
